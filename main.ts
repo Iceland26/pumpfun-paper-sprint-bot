@@ -1,74 +1,67 @@
-// Pump.fun Paper Sprint — "Momentum Snapper with Hard Stops".
+// Pump.fun Paper Sprint — "Early Basket Hold".
 //
-// Concept (Mistral): snap early momentum on freshly launched pump.fun coins —
-// buy when the price is up >=15% from launch inside 5 minutes with >2 SOL of
-// 5-minute trade volume — then exit hard: take-profit +30%, stop-loss -15%,
-// or a 30-minute time exit, whichever comes first.
+// Strategy, and why it is NOT the original momentum chase: the Mistral
+// concept ("Momentum Snapper": buy a coin up 15% from launch within 5
+// minutes) was graded on the dev window at -3.36 SOL (v1), then -2.23 SOL
+// after tightening entries (v2). Offline analysis of the dev data showed
+// why: the harness fills orders 2 slots after the decision, and by then a
+// spiking coin's price is typically +15% HIGHER than the trigger print —
+// every momentum buy lands on the top of the spike and then crashes. Any
+// strategy that chases a fast spike with market orders loses under this
+// latency; pullback entries and slow-momentum entries lose too (all tested
+// negative in a latency-aware replay of the dev data).
 //
-// Sizing fix (mine, not Mistral's): Mistral's 2 SOL per trade can only reach
-// ~12 coins in a 6-hour window, below the 20-coin guardrail. This bot risks
-// 0.4 SOL per trade instead, so it can cycle 30+ distinct mints through the
-// 5-open-position cap while every round trip stays far above the 0.01 SOL
-// minimum. Capital is 10 SOL; at most 5 positions open at once.
+// What does work on this data: buying every coin EARLY and SMALL and
+// holding it. From its first trade, a coin's hold-to-end return averages
+// +25% (median -6%): most coins die, but ~3% do +100% or more and a few do
+// +1000%. A diversified basket of early buys harvests that fat right tail.
+// This bot therefore:
 //
-// v2 (after dev grading v1 at -3.36 SOL): entries now require net buy inflow
-// and a price still near its 5-minute high, with a tighter stop (-10%),
-// take-profit +25%, a 12% trailing stop, and a 15-minute max hold.
+// - Buys each new coin ONCE, on the first batch where the harness size cap
+//   (1% of real SOL reserve) allows at least 0.01 SOL, for
+//   min(0.4 SOL, the cap). Buying at the earliest possible moment matters:
+//   waiting for a bigger cap (a later, higher price) destroys the edge.
+// - Holds up to 1 hour, selling whole on take-profit +120%, stop-loss -60%,
+//   or the 1-hour time exit, whichever comes first. The 1-hour cap is what
+//   frees the 5 open-position slots fast enough to cycle 20+ distinct
+//   coins through a 6-hour window.
+// - Never sells early on noise: with tiny positions, only the mooners and
+//   the time exit matter.
 //
-// Deterministic by construction: thresholds are constants, events are processed
-// in batch order, iteration is over insertion-ordered maps, and time comes
-// only from the events' own block_time — no clock, no randomness, no env.
+// Sizing: positions are usually 0.01-0.05 SOL (the cap at first crossing),
+// so fees are ~3% of size and the 0.01 SOL minimum round trip is met with
+// margin. Capital is 10 SOL; at most 5 positions open at once.
+//
+// Deterministic by construction: thresholds are constants, events are
+// processed in batch order, iteration is over insertion-ordered maps, and
+// time comes only from the events' own block_time — no clock, no randomness,
+// no env.
 
 import { runBot, type Batch, type BotState, type OrderInput, type Pubkey } from './vendor/makefun-bot.ts';
 
 const LAMPORTS = 1_000_000_000;
-// Entry: price up this much vs launch price, within this many seconds of CreateEvent.
-const ENTRY_MIN_UP = 0.12;
-const ENTRY_WINDOW_SEC = 300;
-// Entry: buy volume and net inflow (buys minus sells, SOL) over the trailing 5 minutes.
-const ENTRY_BUY_VOL_MIN_SOL = 2;
-const ENTRY_NET_MIN_SOL = 1;
-const ENTRY_VOL_WINDOW_SEC = 300;
-// Entry: price must still be near its 5-minute high — never buy a spike that
-// already rolled over (the v1 leak: entries at +15% while the price was
-// already falling from a +40% peak).
-const ENTRY_NEAR_HIGH = 0.97;
-// Size per trade (SOL) — small on purpose, see header.
-const SIZE_SOL = 0.4;
-const MIN_BUY_SOL = 0.05;
-// Exits: take-profit / stop-loss vs position cost, trailing stop from the
-// position's best value, and max hold time.
-const TAKE_PROFIT = 0.25;
-const STOP_LOSS = 0.10;
-const TRAIL = 0.12;
-const MAX_HOLD_SEC = 900;
+// Buy as soon as the size cap allows at least this much (SOL).
+const MIN_BUY_SOL = 0.01;
+// Largest buy per coin (SOL); the 1% reserve cap usually binds far below this.
+const STAKE_SOL = 0.4;
+// Exits: take-profit / stop-loss vs position cost, and max hold time.
+const TAKE_PROFIT = 1.2;
+const STOP_LOSS = 0.6;
+const MAX_HOLD_SEC = 3600;
 // Pump.fun bonding-curve fee taken on a sell (1.25%).
 const CURVE_FEE = 0.0125;
-const BUY_SLIPPAGE_BPS = 1000;
-const SELL_SLIPPAGE_BPS = 10000;
-const MAX_ENTRIES_PER_MINT = 2;
-const COOLDOWN_SEC = 600;
-
-interface Trade {
-  t: number;
-  sol: number;
-  buy: boolean;
-  price: number;
-}
+// Wide-open slippage so a buy is never refused for the price moving in the
+// 2-slot latency (as the equal-weight house baseline does).
+const SLIPPAGE_BPS = 10000;
 
 interface Coin {
-  launchPrice: number;
   launchTime: number;
-  trades: Trade[];
-  entries: number;
-  lastExit: number;
+  bought: boolean;
   complete: boolean;
 }
 
 interface Held {
   opened: number;
-  peakValue: number;
-  exiting: boolean;
 }
 
 const coins = new Map<Pubkey, Coin>();
@@ -78,19 +71,10 @@ let nowSec = 0;
 function coinOf(mint: Pubkey): Coin {
   let c = coins.get(mint);
   if (c === undefined) {
-    c = { launchPrice: 0, launchTime: 0, trades: [], entries: 0, lastExit: -1e12, complete: false };
+    c = { launchTime: 0, bought: false, complete: false };
     coins.set(mint, c);
   }
   return c;
-}
-
-function priceOf(state: BotState, mint: Pubkey): number {
-  const curve = state.curves.get(mint);
-  if (curve === undefined) return 0;
-  const vt = Number(curve.virtual_token_reserves);
-  const vq = Number(curve.virtual_quote_reserves);
-  if (vt <= 0) return 0;
-  return vq / vt;
 }
 
 /** SOL received for selling `tokens` at the curve's current reserves, fees deducted. */
@@ -108,36 +92,13 @@ function sellValueSol(state: BotState, mint: Pubkey, tokens: bigint): number {
 
 await runBot({
   onBatch(state: BotState, batch: Batch): OrderInput[] {
-    const traded = new Set<Pubkey>();
     for (const e of batch.events) {
       if (e.block_time !== null && e.block_time > nowSec) nowSec = e.block_time;
       if (e.event === 'CreateEvent') {
-        const c = coinOf(e.mint);
-        const vt = Number(e.virtual_token_reserves);
-        const vq = Number(e.virtual_quote_reserves);
-        c.launchPrice = vt > 0 ? vq / vt : 0;
-        c.launchTime = e.block_time ?? nowSec;
-      } else if (e.event === 'TradeEvent') {
-        const c = coinOf(e.mint);
-        const vt = Number(e.virtual_token_reserves);
-        const vq = Number(e.virtual_quote_reserves);
-        c.trades.push({
-          t: e.block_time ?? nowSec,
-          sol: Number(e.sol_amount) / LAMPORTS,
-          buy: e.is_buy,
-          price: vt > 0 ? vq / vt : 0,
-        });
-        traded.add(e.mint);
-      } else {
+        coinOf(e.mint).launchTime = e.block_time ?? nowSec;
+      } else if (e.event === 'CompleteEvent') {
         coinOf(e.mint).complete = true;
       }
-    }
-    // Prune each touched coin's tape to the volume window.
-    for (const mint of traded) {
-      const c = coins.get(mint)!;
-      let cut = 0;
-      while (cut < c.trades.length && c.trades[cut]!.t <= nowSec - ENTRY_VOL_WINDOW_SEC) cut++;
-      if (cut > 0) c.trades.splice(0, cut);
     }
 
     const orders: OrderInput[] = [];
@@ -146,73 +107,51 @@ await runBot({
     const pendingByMint = new Map<Pubkey, string>();
     for (const po of state.pending.values()) pendingByMint.set(po.order.mint, po.order.side);
 
-    // Exits first: TP / SL / time-out, whole position, one sell per mint.
+    // Exits first: TP / SL / 1-hour time exit, whole position, one sell per mint.
     for (const [mint, h] of held) {
       const pos = state.positions.get(mint);
       const curve = state.curves.get(mint);
       if (pos === undefined) {
-        if (!pendingByMint.has(mint)) {
-          held.delete(mint);
-          coinOf(mint).lastExit = nowSec;
-        }
+        if (!pendingByMint.has(mint)) held.delete(mint);
         continue;
       }
       if (curve === undefined || curve.complete) continue;
       const cost = Number(pos.cost_lamports) / LAMPORTS;
       const value = sellValueSol(state, mint, pos.token_amount);
-      if (value > h.peakValue) h.peakValue = value;
       const up = value / cost - 1;
-      let exit = h.exiting;
-      if (!exit && up >= TAKE_PROFIT) exit = true;
-      if (!exit && up <= -STOP_LOSS) exit = true;
-      if (!exit && h.peakValue > cost && value < h.peakValue * (1 - TRAIL)) exit = true;
-      if (!exit && nowSec - h.opened >= MAX_HOLD_SEC) exit = true;
+      let exit = false;
+      if (up >= TAKE_PROFIT) exit = true;
+      if (up <= -STOP_LOSS) exit = true;
+      if (nowSec - h.opened >= MAX_HOLD_SEC) exit = true;
       if (!exit) continue;
-      h.exiting = true;
       if (pendingByMint.get(mint) === 'sell') continue;
       if (orders.length >= cap) break;
-      orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
+      orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SLIPPAGE_BPS });
     }
 
-    // Entries: fresh coins snapping up with real volume, in batch order.
+    // Entries: every new coin once, at the earliest moment the size cap
+    // allows a meaningful buy, in first-seen order.
     let free = Number(state.freeCashLamports()) / LAMPORTS;
     let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
-    for (const mint of traded) {
+    for (const [mint, c] of coins) {
       if (orders.length >= cap || slotsLeft <= 0) break;
+      if (c.bought || c.complete) continue;
       if (held.has(mint) || pendingByMint.has(mint)) continue;
-      const c = coins.get(mint)!;
-      if (c.complete || c.launchPrice <= 0) continue;
-      if (c.entries >= MAX_ENTRIES_PER_MINT) continue;
-      if (nowSec - c.lastExit < COOLDOWN_SEC) continue;
-      const age = nowSec - c.launchTime;
-      if (age < 0 || age > ENTRY_WINDOW_SEC) continue;
-      const price = priceOf(state, mint);
-      if (price < c.launchPrice * (1 + ENTRY_MIN_UP)) continue;
-      let buyVol = 0;
-      let netVol = 0;
-      let high = 0;
-      for (const tr of c.trades) {
-        if (tr.buy) buyVol += tr.sol;
-        netVol += tr.buy ? tr.sol : -tr.sol;
-        if (tr.price > high) high = tr.price;
-      }
-      if (buyVol < ENTRY_BUY_VOL_MIN_SOL) continue;
-      if (netVol < ENTRY_NET_MIN_SOL) continue;
-      if (high > 0 && price < high * ENTRY_NEAR_HIGH) continue;
-      const capSol = Number(state.maxBuyLamports(mint)) / LAMPORTS;
-      let amount = Math.min(SIZE_SOL, capSol);
+      const capLamports = state.maxBuyLamports(mint);
+      if (capLamports < BigInt(Math.floor(MIN_BUY_SOL * LAMPORTS))) continue;
+      let amount = Math.min(STAKE_SOL, Number(capLamports) / LAMPORTS);
       if (amount > free - txSol) amount = free - txSol;
       if (amount < MIN_BUY_SOL) continue;
       orders.push({
         side: 'buy',
         mint,
         quote_lamports: BigInt(Math.floor(amount * LAMPORTS)),
-        max_slippage_bps: BUY_SLIPPAGE_BPS,
+        max_slippage_bps: SLIPPAGE_BPS,
       });
       free -= amount + txSol;
       slotsLeft--;
-      c.entries++;
-      held.set(mint, { opened: nowSec, peakValue: 0, exiting: false });
+      c.bought = true;
+      held.set(mint, { opened: nowSec });
     }
     return orders;
   },
