@@ -11,6 +11,10 @@
 // 5-open-position cap while every round trip stays far above the 0.01 SOL
 // minimum. Capital is 10 SOL; at most 5 positions open at once.
 //
+// v2 (after dev grading v1 at -3.36 SOL): entries now require net buy inflow
+// and a price still near its 5-minute high, with a tighter stop (-10%),
+// take-profit +25%, a 12% trailing stop, and a 15-minute max hold.
+//
 // Deterministic by construction: thresholds are constants, events are processed
 // in batch order, iteration is over insertion-ordered maps, and time comes
 // only from the events' own block_time — no clock, no randomness, no env.
@@ -19,18 +23,25 @@ import { runBot, type Batch, type BotState, type OrderInput, type Pubkey } from 
 
 const LAMPORTS = 1_000_000_000;
 // Entry: price up this much vs launch price, within this many seconds of CreateEvent.
-const ENTRY_MIN_UP = 0.15;
+const ENTRY_MIN_UP = 0.12;
 const ENTRY_WINDOW_SEC = 300;
-// Entry: trade volume (buys + sells, SOL) over the trailing 5 minutes.
-const ENTRY_VOL_MIN_SOL = 2;
+// Entry: buy volume and net inflow (buys minus sells, SOL) over the trailing 5 minutes.
+const ENTRY_BUY_VOL_MIN_SOL = 2;
+const ENTRY_NET_MIN_SOL = 1;
 const ENTRY_VOL_WINDOW_SEC = 300;
+// Entry: price must still be near its 5-minute high — never buy a spike that
+// already rolled over (the v1 leak: entries at +15% while the price was
+// already falling from a +40% peak).
+const ENTRY_NEAR_HIGH = 0.97;
 // Size per trade (SOL) — small on purpose, see header.
 const SIZE_SOL = 0.4;
 const MIN_BUY_SOL = 0.05;
-// Exits: take-profit / stop-loss vs position cost, and max hold time.
-const TAKE_PROFIT = 0.30;
-const STOP_LOSS = 0.15;
-const MAX_HOLD_SEC = 1800;
+// Exits: take-profit / stop-loss vs position cost, trailing stop from the
+// position's best value, and max hold time.
+const TAKE_PROFIT = 0.25;
+const STOP_LOSS = 0.10;
+const TRAIL = 0.12;
+const MAX_HOLD_SEC = 900;
 // Pump.fun bonding-curve fee taken on a sell (1.25%).
 const CURVE_FEE = 0.0125;
 const BUY_SLIPPAGE_BPS = 1000;
@@ -41,6 +52,8 @@ const COOLDOWN_SEC = 600;
 interface Trade {
   t: number;
   sol: number;
+  buy: boolean;
+  price: number;
 }
 
 interface Coin {
@@ -54,6 +67,7 @@ interface Coin {
 
 interface Held {
   opened: number;
+  peakValue: number;
   exiting: boolean;
 }
 
@@ -105,7 +119,14 @@ await runBot({
         c.launchTime = e.block_time ?? nowSec;
       } else if (e.event === 'TradeEvent') {
         const c = coinOf(e.mint);
-        c.trades.push({ t: e.block_time ?? nowSec, sol: Number(e.sol_amount) / LAMPORTS });
+        const vt = Number(e.virtual_token_reserves);
+        const vq = Number(e.virtual_quote_reserves);
+        c.trades.push({
+          t: e.block_time ?? nowSec,
+          sol: Number(e.sol_amount) / LAMPORTS,
+          buy: e.is_buy,
+          price: vt > 0 ? vq / vt : 0,
+        });
         traded.add(e.mint);
       } else {
         coinOf(e.mint).complete = true;
@@ -139,10 +160,12 @@ await runBot({
       if (curve === undefined || curve.complete) continue;
       const cost = Number(pos.cost_lamports) / LAMPORTS;
       const value = sellValueSol(state, mint, pos.token_amount);
+      if (value > h.peakValue) h.peakValue = value;
       const up = value / cost - 1;
       let exit = h.exiting;
       if (!exit && up >= TAKE_PROFIT) exit = true;
       if (!exit && up <= -STOP_LOSS) exit = true;
+      if (!exit && h.peakValue > cost && value < h.peakValue * (1 - TRAIL)) exit = true;
       if (!exit && nowSec - h.opened >= MAX_HOLD_SEC) exit = true;
       if (!exit) continue;
       h.exiting = true;
@@ -165,9 +188,17 @@ await runBot({
       if (age < 0 || age > ENTRY_WINDOW_SEC) continue;
       const price = priceOf(state, mint);
       if (price < c.launchPrice * (1 + ENTRY_MIN_UP)) continue;
-      let vol = 0;
-      for (const tr of c.trades) vol += tr.sol;
-      if (vol < ENTRY_VOL_MIN_SOL) continue;
+      let buyVol = 0;
+      let netVol = 0;
+      let high = 0;
+      for (const tr of c.trades) {
+        if (tr.buy) buyVol += tr.sol;
+        netVol += tr.buy ? tr.sol : -tr.sol;
+        if (tr.price > high) high = tr.price;
+      }
+      if (buyVol < ENTRY_BUY_VOL_MIN_SOL) continue;
+      if (netVol < ENTRY_NET_MIN_SOL) continue;
+      if (high > 0 && price < high * ENTRY_NEAR_HIGH) continue;
       const capSol = Number(state.maxBuyLamports(mint)) / LAMPORTS;
       let amount = Math.min(SIZE_SOL, capSol);
       if (amount > free - txSol) amount = free - txSol;
@@ -181,7 +212,7 @@ await runBot({
       free -= amount + txSol;
       slotsLeft--;
       c.entries++;
-      held.set(mint, { opened: nowSec, exiting: false });
+      held.set(mint, { opened: nowSec, peakValue: 0, exiting: false });
     }
     return orders;
   },
