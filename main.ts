@@ -45,9 +45,9 @@ const MIN_BUY_SOL = 0.01;
 // Largest buy per coin (SOL); the 1% reserve cap usually binds far below this.
 const STAKE_SOL = 0.4;
 // Exits: take-profit / stop-loss vs position cost, and max hold time.
-const TAKE_PROFIT = 1.2;
-const STOP_LOSS = 0.6;
-const MAX_HOLD_SEC = 3600;
+const TAKE_PROFIT = 1.0;
+const STOP_LOSS = 0.5;
+const MAX_HOLD_SEC = 4500;
 // Pump.fun bonding-curve fee taken on a sell (1.25%).
 const CURVE_FEE = 0.0125;
 // Wide-open slippage so a buy is never refused for the price moving in the
